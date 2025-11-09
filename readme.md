@@ -7,4 +7,5 @@ python pick_top3_per_set_insightface_gpu.py photos.zip --ref reference.jpg --gpu
 python pick_top3_per_set_insightface_gpu.py photos.zip --ref reference.jpg --gpu
 --w-face 1.0 --w-sharp 0 --w-expo 0 --w-farea 0
 
-python pick_top3_per_set_insightface_gpu.py photos.zip --ref reference.jpg --gpu --w-face 1.0 --w-sharp 0 --w-expo 0 --w-farea 0 --topk 3 --zip winners_flat.zip --zip-only
+python pick_top3_per_set_insightface_gpu.py photos.zip --ref reference.png --gpu --w-face 1.0 --w-sharp 0 --w-expo 0 --w-farea 0 --topk 3 --min-score 0.74 --zip winners_flat_074.zip
+
