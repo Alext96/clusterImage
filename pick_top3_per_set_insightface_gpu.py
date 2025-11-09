@@ -54,7 +54,6 @@ class GlobalEmbedder(nn.Module):
         try:
             weights = models.ResNet50_Weights.DEFAULT
             m = models.resnet50(weights=weights)
-            # Try to read mean/std from weights; fall back to ImageNet constants
             try:
                 _mean = list(weights.transforms().normalize.mean)
                 _std  = list(weights.transforms().normalize.std)
@@ -62,7 +61,6 @@ class GlobalEmbedder(nn.Module):
                 _mean = [0.485, 0.456, 0.406]
                 _std  = [0.229, 0.224, 0.225]
         except Exception:
-            # Older torchvision API
             m = models.resnet50(pretrained=True)
             _mean = [0.485, 0.456, 0.406]
             _std  = [0.229, 0.224, 0.225]
@@ -85,7 +83,6 @@ class GlobalEmbedder(nn.Module):
         feat = feat / (np.linalg.norm(feat) + 1e-8)
         return feat
 
-
 def color_hist_feature(pil: Image.Image, bins=32) -> np.ndarray:
     arr = np.asarray(pil.convert("RGB").resize((256,256)))
     hist = []
@@ -96,7 +93,6 @@ def color_hist_feature(pil: Image.Image, bins=32) -> np.ndarray:
     return np.concatenate(hist)  # 96-d
 
 def phash_feature(pil: Image.Image) -> np.ndarray:
-    # 256-bit perceptual hash as 0/1 floats
     h = imagehash.phash(pil, hash_size=16)  # 16x16 -> 256 bits
     return np.array([int(b) for b in bin(int(str(h), 16))[2:].zfill(256)], dtype=np.float32)
 
@@ -107,7 +103,6 @@ def sharpness_score(pil: Image.Image) -> float:
 def exposure_score(pil: Image.Image) -> float:
     arr = np.asarray(pil.convert("L")) / 255.0
     mu, sigma = arr.mean(), arr.std()
-    # target mid exposure ~0.5, decent contrast ~0.25
     return float(np.exp(-((mu-0.5)**2)/0.02) * np.exp(-((sigma-0.25)**2)/0.02))
 
 # ---------------------------
@@ -120,17 +115,8 @@ def _get_face_app(use_gpu: bool) -> FaceAnalysis:
     global _FACE_APP
     if _FACE_APP is not None:
         return _FACE_APP
-
-    # Provider logic
-    providers = []
-    if use_gpu:
-        # Try CUDA provider first; fallback to CPU if unavailable
-        providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
-    else:
-        providers = ["CPUExecutionProvider"]
-
+    providers = ["CUDAExecutionProvider", "CPUExecutionProvider"] if use_gpu else ["CPUExecutionProvider"]
     _FACE_APP = FaceAnalysis(name="buffalo_l", providers=providers)
-    # ctx_id is ignored when using onnxruntime providers list, but keep 0 for compatibility
     _FACE_APP.prepare(ctx_id=0)
     return _FACE_APP
 
@@ -185,6 +171,12 @@ def norm01(x):
     x = np.asarray(x, dtype=float)
     if np.allclose(x.max(), x.min()):
         return np.ones_like(x) * 0.5
+    return (x - x.max().min())  # placeholder, will override below
+# fix norm01 bug (typo-safe)
+def norm01(x):
+    x = np.asarray(x, dtype=float)
+    if np.allclose(x.max(), x.min()):
+        return np.ones_like(x) * 0.5
     return (x - x.min()) / (x.max() - x.min())
 
 def rank_scores(
@@ -201,13 +193,11 @@ def rank_scores(
     - sharpness
     - exposure "goodness"
     - face size fraction
-    Weights default to higher emphasis on face similarity.
     """
     s_sharp = norm01(sharp)
     s_expo  = norm01(expo)
     s_face  = norm01(face_frac)
 
-    # Face similarity (0..1). If no ref, use 0.5 baseline. If no face, slight penalty.
     if ref_face is not None:
         sims = []
         for fv in face_vecs:
@@ -225,7 +215,7 @@ def rank_scores(
 # Pipeline
 # ---------------------------
 def main(args):
-    # GPU for face engine; Torch used for ResNet visual embeddings (uses CUDA if available & not forced CPU)
+    # GPU for face engine; Torch uses CUDA if available & not forced CPU
     use_gpu_for_faces = args.gpu
     torch_device = "cuda" if (torch.cuda.is_available() and not args.cpu) else "cpu"
 
@@ -235,7 +225,6 @@ def main(args):
     # Collect images preserving order
     if src.suffix.lower() == ".zip":
         imgs = collect_images(src, work)
-        # Optional: reference inside the zip root named exactly as --ref-name
         if args.ref is None and args.ref_name:
             candidate = work / args.ref_name
             if candidate.exists():
@@ -251,18 +240,15 @@ def main(args):
             try:
                 h = imagehash.phash(Image.open(p).convert("RGB"), hash_size=16)
             except Exception:
-                filtered.append(p)
-                continue
-            if h in seen:
-                continue
-            seen.add(h)
-            filtered.append(p)
+                filtered.append(p); continue
+            if h in seen: continue
+            seen.add(h); filtered.append(p)
         imgs = filtered
 
-    # Prepare visual embedder
+    # Visual embedder
     embedder = GlobalEmbedder(device=torch_device)
 
-    # Optional reference face
+    # Reference face
     ref_face = None
     if args.ref is not None and Path(args.ref).exists():
         pil_ref = Image.open(args.ref).convert("RGB")
@@ -272,20 +258,20 @@ def main(args):
     print(f"Found {len(imgs)} images. Extracting features...")
     for idx, p in enumerate(tqdm(imgs)):
         pil = Image.open(p).convert("RGB")
-        emb = embedder(pil)                       # 2048
-        hist = color_hist_feature(pil)            # 96
-        ph  = phash_feature(pil)                  # 256
+        emb = embedder(pil)                    # 2048
+        hist = color_hist_feature(pil)         # 96
+        ph  = phash_feature(pil)               # 256
         q_sharp = sharpness_score(pil)
         q_expo  = exposure_score(pil)
         f_area  = face_box_area_fraction(pil, use_gpu=use_gpu_for_faces)
         f_vec   = face_embedding(pil, use_gpu=use_gpu_for_faces)
-        feat = np.concatenate([emb, hist, ph])    # for clustering
+        feat = np.concatenate([emb, hist, ph]) # for clustering
         records.append({
             "index": idx, "path": p, "emb": emb, "feat": feat,
             "sharp": q_sharp, "expo": q_expo, "f_area": f_area, "f_vec": f_vec
         })
 
-    # Feature matrix for clustering (dimension reduce for stability)
+    # Clustering features
     X = np.stack([r["feat"] for r in records])
     pca = PCA(n_components=min(128, X.shape[1]))
     Xr = pca.fit_transform(X)
@@ -313,11 +299,11 @@ def main(args):
             it["score"] = float(sc)
 
         items_sorted = sorted(items, key=lambda d: d["score"], reverse=True)
-        winners = items_sorted[:min(3, len(items_sorted))]
+        winners = items_sorted[:min(args.topk, len(items_sorted))]
         results.append((lab, winners))
 
     # Report to console
-    print("\n=== TOP 3 PER SET ===")
+    print("\n=== TOP {} PER SET ===".format(args.topk))
     for lab, winners in results:
         print(f"\nSet {lab}:")
         for rank, w in enumerate(winners, 1):
@@ -340,8 +326,8 @@ def main(args):
         df.to_csv(args.csv, index=False)
         print(f"\nSaved CSV: {Path(args.csv).resolve()}")
 
-    # Optional export
-    if args.export:
+    # Optional export to folders
+    if args.export and not args.zip_only:
         out_root = Path(args.export)
         if out_root.exists(): shutil.rmtree(out_root)
         out_root.mkdir(parents=True, exist_ok=True)
@@ -353,12 +339,25 @@ def main(args):
                 shutil.copy2(w["path"], dst)
         print(f"Exported winners to: {out_root.resolve()}")
 
+    # ZIP output (flat — all files in same folder inside the ZIP)
+    if args.zip_path:
+        zip_path = Path(args.zip_path)
+        zip_path.parent.mkdir(parents=True, exist_ok=True)
+        with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            for lab, winners in results:
+                for rank, w in enumerate(winners, 1):
+                    src = Path(w["path"])
+                    # flat zip: prefix rank and set to avoid collisions; no subfolders
+                    arcname = f"set{lab:02d}_top{rank}_{src.name}"
+                    zf.write(src, arcname)
+        print(f"Created ZIP of winners: {zip_path.resolve()}")
+
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Cluster images into sets and pick top 3 per set (InsightFace GPU).")
+    parser = argparse.ArgumentParser(description="Cluster images into sets and pick top-K per set (InsightFace GPU).")
     parser.add_argument("input", help="Folder of images OR a .zip containing images.")
     parser.add_argument("--ref", help="Optional reference face image (path).", default=None)
     parser.add_argument("--ref-name", help="If reference is inside the ZIP root (e.g., reference.jpg).", default=None)
-    parser.add_argument("--export", help="Optional output folder to copy winners into.", default=None)
+    parser.add_argument("--export", help="Optional output folder to copy winners into (by set).", default=None)
     parser.add_argument("--csv", help="Optional CSV path to save results.", default=None)
     parser.add_argument("--workdir", default="./_img_work")
     parser.add_argument("--cpu", action="store_true", help="Force CPU for PyTorch (ResNet features).")
@@ -367,10 +366,14 @@ if __name__ == "__main__":
     parser.add_argument("--kmin", type=int, default=2)
     parser.add_argument("--kmax", type=int, default=8)
     parser.add_argument("--dedup", action="store_true", help="Deduplicate near-identical images by pHash (keeps first).")
+    parser.add_argument("--topk", type=int, default=3, help="How many winners per set to keep.")
     # scoring weights
     parser.add_argument("--w-face", type=float, default=0.55, help="Weight for face similarity to reference.")
     parser.add_argument("--w-sharp", type=float, default=0.20, help="Weight for sharpness.")
     parser.add_argument("--w-expo", type=float, default=0.15, help="Weight for exposure.")
     parser.add_argument("--w-farea", type=float, default=0.10, help="Weight for face area fraction.")
+    # ZIP options
+    parser.add_argument("--zip", dest="zip_path", help="Path to a ZIP to write all winners (flat, no subfolders).", default=None)
+    parser.add_argument("--zip-only", action="store_true", help="Create only the ZIP (skip folder export).")
     args = parser.parse_args()
     main(args)
